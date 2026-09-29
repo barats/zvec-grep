@@ -1384,15 +1384,22 @@ fn grok_permission_block() -> String {
 
 fn has_grok_permission_table(existing: &str) -> bool {
     existing.lines().any(|line| {
-        let Some(rest) = line.trim_start().strip_prefix('[') else {
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix('[') {
+            let rest = rest.strip_prefix('[').unwrap_or(rest);
+            let Some(table) = rest.split(']').next() else {
+                return false;
+            };
+            let table = table.trim().trim_matches(|c| c == '"' || c == '\'');
+            return table == "permission" || table.starts_with("permission.");
+        }
+        // TOML forbids redefining a key as a table, so any root-level
+        // `permission` definition (dotted key, inline table, or scalar)
+        // makes a later [permission] table invalid; match it and skip.
+        let Some(rest) = line.strip_prefix("permission") else {
             return false;
         };
-        let rest = rest.strip_prefix('[').unwrap_or(rest);
-        let Some(table) = rest.split(']').next() else {
-            return false;
-        };
-        let table = table.trim().trim_matches(|c| c == '"' || c == '\'');
-        table == "permission" || table.starts_with("permission.")
+        rest.starts_with('.') || rest.starts_with(|c: char| c == '=' || c.is_whitespace())
     })
 }
 
@@ -2578,11 +2585,22 @@ mod tests {
         ));
         assert!(has_grok_permission_table("[permission.allow]"));
         assert!(has_grok_permission_table("[\"permission\"]"));
+        assert!(has_grok_permission_table("['permission']"));
         assert!(!has_grok_permission_table(
             "[mcp_servers.zvec_grep]\ncommand = \"zg\""
         ));
         assert!(!has_grok_permission_table("[permissions]\nallow = []"));
-        assert!(!has_grok_permission_table("permission = true"));
+        // TOML forbids redefining a key as a table: a root-level
+        // `permission` definition makes a later [permission] table
+        // invalid, so every root-level spelling must match.
+        assert!(has_grok_permission_table(
+            "permission.allow = [\"Bash(git *)\"]"
+        ));
+        assert!(has_grok_permission_table(
+            "permission = { allow = [\"Bash(git *)\"] }"
+        ));
+        assert!(has_grok_permission_table("permission = true"));
+        assert!(!has_grok_permission_table("permissionx = true"));
     }
 
     #[test]
