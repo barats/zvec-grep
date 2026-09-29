@@ -607,6 +607,45 @@ test("Grok Build installer skips pre-approval when a [permission] table exists",
   assert.match(stdout, /MCPTool\(zvec_grep__\*\)/);
 });
 
+test("Grok Build installer skips pre-approval for alternate TOML permission spellings", async (t) => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-install-grok-permission-toml-"),
+  );
+  t.after(async () => {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  const spellings = [
+    {
+      name: "single-quoted header",
+      lines: ["['permission']", 'allow = ["Bash(git *)"]', ""],
+    },
+    {
+      name: "dotted root key",
+      lines: ['permission.allow = ["Bash(git *)"]', ""],
+    },
+    {
+      name: "inline table",
+      lines: ['permission = { allow = ["Bash(git *)"] }', ""],
+    },
+  ];
+
+  for (const { name, lines } of spellings) {
+    const grokHome = join(temporaryDirectory, name.replaceAll(" ", "-"));
+    await mkdir(grokHome, { recursive: true });
+    const configPath = join(grokHome, "config.toml");
+    await writeFile(configPath, [...lines, ""].join("\n"));
+
+    const { stdout } = await installTarget("grok", { GROK_HOME: grokHome });
+
+    const config = await readFile(configPath, "utf8");
+    assert.match(config, /\[mcp_servers\.zvec_grep\]/);
+    assert.doesNotMatch(config, /ZVEC_GREP_PERMISSION/);
+    assert.match(config, /allow = \["Bash\(git \*\)"\]/);
+    assert.match(stdout, /MCPTool\(zvec_grep__\*\)/);
+  }
+});
+
 test("Grok Build installer accepts grok-build and grok-cli aliases", async (t) => {
   const temporaryDirectory = await mkdtemp(
     join(tmpdir(), "zvec-grep-install-grok-aliases-"),

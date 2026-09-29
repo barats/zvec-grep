@@ -2933,11 +2933,14 @@ ${GROK_PERMISSION_RULE_END}`;
 }
 
 function hasGrokPermissionTable(existing: string): boolean {
+  // Line-level TOML checking cannot resolve table context, so it errs toward
+  // matching: a false positive only skips the managed block, while a miss
+  // would append a duplicate [permission] table and unload the config.
+  const header = /^\s*\[\[?\s*['"]?permission['"]?(?:\.[^\]]*)?\s*\]\]?/;
+  const rootKey = /^\s*permission(?:\.[A-Za-z0-9_-]+)*\s*=/;
   return existing
     .split(/\r?\n/)
-    .some((line) =>
-      /^\s*\[\[?\s*"?permission"?(?:\.[^\]]*)?\s*\]\]?/.test(line),
-    );
+    .some((line) => header.test(line) || rootKey.test(line));
 }
 
 function grokGuidanceBlock(): string {

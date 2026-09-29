@@ -205,15 +205,15 @@ every turn while a modular `.instructions.md` file is path-scoped. Uninstall
 removes the managed block, drops the header when the installer added it, and
 deletes the instructions file once nothing else remains in it.
 
-For Grok Build, the installer manages three files under
+For Grok Build, the installer manages two files under
 `${GROK_HOME:-~/.grok}`. The MCP entry lives in the user-level `config.toml`
 and, in stdio mode, sets `startup_timeout_sec = 120` because first-run daemon
 and local-model warmup can exceed Grok Build's 30-second startup default; an
 HTTP entry references `--mcp-token-env` as a `Bearer ${NAME}` Authorization
 header, which Grok Build expands at load time. Search guidance is written to
 `rules/zvec-grep.md`, a global rules file Grok Build loads in every project, so
-no existing instructions file is modified. Tool pre-approval is a managed
-`[permission]` table with `allow = ["MCPTool(zvec_grep__*)"]`. TOML allows only
+no existing instructions file is modified. Tool pre-approval lives beside the
+MCP entry as a managed `[permission]` table in the same `config.toml`, with `allow = ["MCPTool(zvec_grep__*)"]`. TOML allows only
 one `[permission]` table per file, so when the configuration already defines
 one — including the inline `rules` array form — the installer leaves it
 untouched, skips the managed table, and reports the compact rule to add
@@ -279,7 +279,9 @@ is available. It is `zvec_grep_search` in Codex and Claude Code,
 `zvec_grep_zvec_grep_search` in OpenCode. With the optional `full` MCP toolset,
 Qoder CLI exposes managed rg as `mcp__zvec_grep__zvec_grep_rg`. For Qoder IDE,
 confirm after restart that the `zvec_grep` server and its tools appear; the exact
-host-qualified tool label remains part of the real-machine smoke test. If the
+host-qualified tool label remains part of the real-machine smoke test. In Grok
+Build, the host-qualified tools are `zvec_grep__zvec_grep_search` and
+`zvec_grep__zvec_grep_rg` (full toolset). If the
 MCP connection is unavailable, the same indexed search and optional managed-rg
 route remain available from the shell:
 
