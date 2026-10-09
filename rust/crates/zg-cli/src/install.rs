@@ -1409,6 +1409,19 @@ fn has_grok_permission_table(existing: &str) -> bool {
             let table = table.trim().trim_matches(|c| c == '"' || c == '\'');
             return table == "permission" || table.starts_with("permission.");
         }
+        // TOML permits quoting key segments. A quoted `permission` segment
+        // followed by `=` or `.` defines the same root key as the bare
+        // spelling and equally forbids a later [permission] table.
+        if let Some(quote) = line.chars().next().filter(|c| *c == '"' || *c == '\'') {
+            let Some(offset) = line[1..].find(quote) else {
+                return false;
+            };
+            let key = &line[1..=offset];
+            let rest = &line[offset + 2..];
+            return key == "permission"
+                && (rest.starts_with('.')
+                    || rest.starts_with(|c: char| c == '=' || c.is_whitespace()));
+        }
         // TOML forbids redefining a key as a table, so any root-level
         // `permission` definition (dotted key, inline table, or scalar)
         // makes a later [permission] table invalid; match it and skip.
@@ -2618,6 +2631,49 @@ mod tests {
         ));
         assert!(has_grok_permission_table("permission = true"));
         assert!(!has_grok_permission_table("permissionx = true"));
+        // Quoted root-key spellings name the same TOML key as the bare ones.
+        assert!(has_grok_permission_table(
+            "'permission' = { allow = [\"Bash(git *)\"] }"
+        ));
+        assert!(has_grok_permission_table(
+            "\"permission\".allow = [\"Bash(git *)\"]"
+        ));
+        assert!(has_grok_permission_table("'permission' = true"));
+        // The closing quote bounds the key: longer quoted names are
+        // unrelated keys and must keep matching the bare prefix guard.
+        assert!(!has_grok_permission_table("\"permission level\" = 3"));
+        assert!(!has_grok_permission_table("'permissionx' = true"));
+    }
+
+    #[test]
+    fn grok_install_skips_permission_block_for_quoted_root_keys() {
+        for existing in [
+            "'permission' = { allow = [\"Bash(git *)\"] }\n",
+            "\"permission\".allow = [\"Bash(git *)\"]\n",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = dir.path().join("config.toml");
+            let guidance = dir.path().join("rules").join("zvec-grep.md");
+            std::fs::create_dir_all(guidance.parent().expect("parent")).expect("rules dir");
+            std::fs::write(&config, existing).expect("write config");
+            let options = AgentOptions {
+                force: false,
+                transport: McpInstallTransport::Stdio,
+                toolset: None,
+                timeout_seconds: 600,
+                token_env: None,
+            };
+            let result = install_grok_into(&config, &guidance, &options, || {
+                Ok("http://127.0.0.1:7999/mcp".to_owned())
+            })
+            .expect("install");
+            let note = result.config_note.expect("skip note");
+            assert!(note.contains("already defines [permission]"));
+            let after = std::fs::read_to_string(&config).expect("read config");
+            assert!(!after.contains(GROK_PERMISSION_START));
+            assert_eq!(after.matches("[permission]").count(), 0);
+            assert!(after.contains("[mcp_servers.zvec_grep]"));
+        }
     }
 
     #[test]
