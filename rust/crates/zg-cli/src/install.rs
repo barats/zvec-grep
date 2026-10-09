@@ -648,18 +648,33 @@ fn uninstall_codex() -> Result<(), InstallError> {
 
 fn install_grok(options: &AgentOptions) -> Result<AgentInstallResult, InstallError> {
     let home = grok_home();
-    let config = home.join("config.toml");
-    let guidance = home.join("rules").join("zvec-grep.md");
+    install_grok_into(
+        &home.join("config.toml"),
+        &home.join("rules").join("zvec-grep.md"),
+        options,
+        resolve_server_url,
+    )
+}
+
+fn install_grok_into(
+    config: &Path,
+    guidance: &Path,
+    options: &AgentOptions,
+    resolve_url: impl Fn() -> Result<String, InstallError>,
+) -> Result<AgentInstallResult, InstallError> {
+    // Resolve the server URL before any write: a broken global configuration
+    // must fail the install instead of persisting a fallback URL.
+    let block = grok_config_block(options, resolve_url)?;
     write_marked_file(
-        &config,
+        config,
         CONFIG_START,
         CONFIG_END,
-        &grok_config_block(options),
+        &block,
         options.force,
         Some(codex_conflict),
         Some(remove_codex_conflict),
     )?;
-    let existing = read_if_exists(&config)?;
+    let existing = read_if_exists(config)?;
     let note = if !existing.contains(GROK_PERMISSION_START) && has_grok_permission_table(&existing)
     {
         // TOML allows only one [permission] table and forbids extending an
@@ -670,7 +685,7 @@ fn install_grok(options: &AgentOptions) -> Result<AgentInstallResult, InstallErr
         ))
     } else {
         write_marked_file(
-            &config,
+            config,
             GROK_PERMISSION_START,
             GROK_PERMISSION_END,
             &grok_permission_block(),
@@ -681,7 +696,7 @@ fn install_grok(options: &AgentOptions) -> Result<AgentInstallResult, InstallErr
         None
     };
     write_marked_file(
-        &guidance,
+        guidance,
         GUIDANCE_START,
         GUIDANCE_END,
         &guidance_block("zvec_grep_search", "zvec_grep_rg", false, grok_host_notes()),
@@ -690,7 +705,7 @@ fn install_grok(options: &AgentOptions) -> Result<AgentInstallResult, InstallErr
         None,
     )?;
     Ok(AgentInstallResult {
-        config_path: Some(config),
+        config_path: Some(config.to_path_buf()),
         config_note: note,
     })
 }
@@ -1353,7 +1368,10 @@ fn grok_home() -> PathBuf {
     env_path("GROK_HOME").unwrap_or_else(|| home_dir().join(".grok"))
 }
 
-fn grok_config_block(options: &AgentOptions) -> String {
+fn grok_config_block(
+    options: &AgentOptions,
+    resolve_url: impl Fn() -> Result<String, InstallError>,
+) -> Result<String, InstallError> {
     let connection = match options.transport {
         McpInstallTransport::Stdio => format!(
             "command = \"zg\"\nargs = {}\n# First-run daemon and local-model warmup can exceed Grok's 30s startup default.\nstartup_timeout_sec = 120",
@@ -1366,13 +1384,12 @@ fn grok_config_block(options: &AgentOptions) -> String {
                 .map_or_else(String::new, |token| {
                     format!("\nheaders = {{ Authorization = \"Bearer ${{{token}}}\" }}")
                 });
-            format!(
-                "url = \"{}\"{token}",
-                resolve_server_url().unwrap_or_else(|_| "http://127.0.0.1:7999/mcp".to_owned())
-            )
+            format!("url = \"{}\"{token}", resolve_url()?)
         }
     };
-    format!("{CONFIG_START}\n[mcp_servers.zvec_grep]\n{connection}\n{CONFIG_END}")
+    Ok(format!(
+        "{CONFIG_START}\n[mcp_servers.zvec_grep]\n{connection}\n{CONFIG_END}"
+    ))
 }
 
 fn grok_permission_block() -> String {
@@ -2499,29 +2516,82 @@ mod tests {
 
     #[test]
     fn grok_config_block_varies_by_transport() {
-        let stdio = grok_config_block(&AgentOptions {
-            force: false,
-            transport: McpInstallTransport::Stdio,
-            toolset: None,
-            timeout_seconds: 600,
-            token_env: None,
-        });
+        let resolve = || Ok("http://127.0.0.1:7999/mcp".to_owned());
+        let stdio = grok_config_block(
+            &AgentOptions {
+                force: false,
+                transport: McpInstallTransport::Stdio,
+                toolset: None,
+                timeout_seconds: 600,
+                token_env: None,
+            },
+            resolve,
+        )
+        .expect("stdio block");
         assert!(stdio.contains("[mcp_servers.zvec_grep]"));
         assert!(stdio.contains("args = [\"--server\", \"--stdio\"]"));
         assert!(stdio.contains("startup_timeout_sec = 120"));
         assert!(!stdio.contains("tool_timeout_sec"));
-        let http = grok_config_block(&AgentOptions {
-            force: false,
-            transport: McpInstallTransport::Http,
-            toolset: None,
-            timeout_seconds: 600,
-            token_env: Some("ZVEC_GREP_SERVER_TOKEN".to_owned()),
-        });
+        let http = grok_config_block(
+            &AgentOptions {
+                force: false,
+                transport: McpInstallTransport::Http,
+                toolset: None,
+                timeout_seconds: 600,
+                token_env: Some("ZVEC_GREP_SERVER_TOKEN".to_owned()),
+            },
+            resolve,
+        )
+        .expect("http block");
         assert!(http.starts_with("# ZVEC_GREP_START\n[mcp_servers.zvec_grep]\nurl = \""));
         assert!(
             http.contains("headers = { Authorization = \"Bearer ${ZVEC_GREP_SERVER_TOKEN}\" }")
         );
         assert!(!http.contains("startup_timeout_sec"));
+    }
+
+    #[test]
+    fn grok_config_block_propagates_url_resolution_errors() {
+        let result = grok_config_block(
+            &AgentOptions {
+                force: false,
+                transport: McpInstallTransport::Http,
+                toolset: None,
+                timeout_seconds: 600,
+                token_env: None,
+            },
+            || Err(InstallError::Message("broken config".to_owned())),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn grok_install_failure_leaves_existing_files_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        let guidance = dir.path().join("rules").join("zvec-grep.md");
+        std::fs::create_dir_all(guidance.parent().expect("parent")).expect("rules dir");
+        std::fs::write(&config, "user_key = 1\n").expect("write config");
+        std::fs::write(&guidance, "user note\n").expect("write guidance");
+        let options = AgentOptions {
+            force: false,
+            transport: McpInstallTransport::Http,
+            toolset: None,
+            timeout_seconds: 600,
+            token_env: None,
+        };
+        let result = install_grok_into(&config, &guidance, &options, || {
+            Err(InstallError::Message("broken config".to_owned()))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config"),
+            "user_key = 1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&guidance).expect("guidance"),
+            "user note\n"
+        );
     }
 
     #[test]
