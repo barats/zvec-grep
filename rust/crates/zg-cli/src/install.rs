@@ -642,8 +642,14 @@ fn install_codex(options: &AgentOptions) -> Result<(), InstallError> {
 
 fn uninstall_codex() -> Result<(), InstallError> {
     let home = env_path("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex"));
-    remove_marked_toml_block(&home.join("config.toml"), CONFIG_START, CONFIG_END)?;
-    remove_marked_file(&home.join("AGENTS.md"), GUIDANCE_START, GUIDANCE_END)
+    uninstall_codex_from(&home.join("config.toml"), &home.join("AGENTS.md"))
+}
+
+fn uninstall_codex_from(config: &Path, guidance: &Path) -> Result<(), InstallError> {
+    // The managed entry is removed whole: retaining the table header for
+    // user-added fields would leave an MCP entry without a transport.
+    remove_marked_file(config, CONFIG_START, CONFIG_END)?;
+    remove_marked_file(guidance, GUIDANCE_START, GUIDANCE_END)
 }
 
 fn install_grok(options: &AgentOptions) -> Result<AgentInstallResult, InstallError> {
@@ -720,7 +726,9 @@ fn uninstall_grok() -> Result<(), InstallError> {
 
 fn uninstall_grok_from(config: &Path, guidance: &Path) -> Result<(), InstallError> {
     remove_marked_toml_block(config, GROK_PERMISSION_START, GROK_PERMISSION_END)?;
-    remove_marked_toml_block(config, CONFIG_START, CONFIG_END)?;
+    // The managed entry is removed whole: retaining the table header for
+    // user-added fields would leave an MCP entry without a transport.
+    remove_marked_file(config, CONFIG_START, CONFIG_END)?;
     remove_marked_file(guidance, GUIDANCE_START, GUIDANCE_END)?;
     if guidance.exists() && read_if_exists(guidance)?.trim().is_empty() {
         fs::remove_file(guidance)?;
@@ -1835,6 +1843,9 @@ fn remove_marked_file(path: &Path, start: &str, end: &str) -> Result<(), Install
 /// table; dropping it would orphan those user fields at the document root.
 /// Ranges are paired like `replace_marked_block`, so an orphaned start
 /// marker never widens the removal onto surrounding user configuration.
+/// This retention only suits the Grok permission table, whose user fields
+/// stay valid under the retained header; managed MCP entries are removed
+/// whole because a table without its transport is not loadable.
 fn remove_marked_toml_block(path: &Path, start: &str, end: &str) -> Result<(), InstallError> {
     let existing = read_if_exists(path)?;
     if existing.is_empty() {
@@ -2765,29 +2776,92 @@ mod tests {
     }
 
     #[test]
-    fn remove_marked_toml_block_retains_header_for_trailing_table_fields() {
+    fn grok_uninstall_removes_managed_mcp_table_despite_trailing_fields() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "# ZVEC_GREP_START\n[mcp_servers.zvec_grep]\ncommand = \"zg\"\nargs = [\"--server\", \"--stdio\"]\n# ZVEC_GREP_END\nenv = { FOO = \"bar\" }\n\n[other]\nkey = 1\n",
-        )
-        .expect("write config");
-        remove_marked_toml_block(&path, CONFIG_START, CONFIG_END).expect("remove");
-        let root: toml::Value = toml::from_str(&std::fs::read_to_string(&path).expect("read"))
-            .expect("valid toml after removal");
-        let table = root
-            .get("mcp_servers")
-            .and_then(|value| value.get("zvec_grep"))
-            .expect("retained table");
+        let config = dir.path().join("config.toml");
+        let guidance = dir.path().join("rules").join("zvec-grep.md");
+        std::fs::create_dir_all(guidance.parent().expect("parent")).expect("rules dir");
+        let options = AgentOptions {
+            force: false,
+            transport: McpInstallTransport::Stdio,
+            toolset: None,
+            timeout_seconds: 600,
+            token_env: None,
+        };
+        install_grok_into(&config, &guidance, &options, || {
+            Ok("http://127.0.0.1:7999/mcp".to_owned())
+        })
+        .expect("install");
+        let text = std::fs::read_to_string(&config).expect("read installed config");
+        let edited = text.replacen(
+            CONFIG_END,
+            &format!("{CONFIG_END}\nenv = {{ FOO = \"bar\" }}"),
+            1,
+        );
+        assert_ne!(edited, text, "config end marker must be present");
+        std::fs::write(&config, edited).expect("append user env field");
+        let root: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config).expect("read")).expect("valid toml");
         assert_eq!(
-            table.get("env").and_then(|value| value.get("FOO")),
+            root.get("mcp_servers")
+                .and_then(|value| value.get("zvec_grep"))
+                .and_then(|value| value.get("env"))
+                .and_then(|value| value.get("FOO")),
             Some(&toml::Value::String("bar".to_owned()))
         );
-        assert!(table.get("command").is_none());
+        uninstall_grok_from(&config, &guidance).expect("uninstall");
+        let text = std::fs::read_to_string(&config).expect("read after uninstall");
+        let root: toml::Value = toml::from_str(&text).expect("valid toml after uninstall");
+        assert!(root.get("mcp_servers").is_none());
+        assert!(root.get("permission").is_none());
         assert_eq!(
-            root.get("other").and_then(|value| value.get("key")),
-            Some(&toml::Value::Integer(1))
+            root.get("env").and_then(|value| value.get("FOO")),
+            Some(&toml::Value::String("bar".to_owned()))
+        );
+        install_grok_into(&config, &guidance, &options, || {
+            Ok("http://127.0.0.1:7999/mcp".to_owned())
+        })
+        .expect("reinstall without --force");
+        let text = std::fs::read_to_string(&config).expect("read after reinstall");
+        assert!(text.contains(CONFIG_START));
+        assert!(text.contains("command = \"zg\""));
+        assert!(text.contains("env = { FOO = \"bar\" }"));
+    }
+
+    #[test]
+    fn codex_uninstall_preserves_user_config_after_orphaned_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        let guidance = dir.path().join("AGENTS.md");
+        std::fs::write(
+            &config,
+            "# ZVEC_GREP_START\n[mcp_servers.other]\ncommand = \"other\"\n\n# ZVEC_GREP_START\n[mcp_servers.zvec_grep]\ncommand = \"zg\"\n# ZVEC_GREP_END\n",
+        )
+        .expect("write config");
+        std::fs::write(
+            &guidance,
+            "prefix\n\n<!-- ZVEC_GREP_START -->\nguidance\n<!-- ZVEC_GREP_END -->\n",
+        )
+        .expect("write guidance");
+        uninstall_codex_from(&config, &guidance).expect("uninstall");
+        let text = std::fs::read_to_string(&config).expect("read");
+        let root: toml::Value = toml::from_str(&text).expect("valid toml after uninstall");
+        assert_eq!(
+            root.get("mcp_servers")
+                .and_then(|value| value.get("other"))
+                .and_then(|value| value.get("command")),
+            Some(&toml::Value::String("other".to_owned()))
+        );
+        assert!(
+            root.get("mcp_servers")
+                .and_then(|value| value.get("zvec_grep"))
+                .is_none()
+        );
+        assert!(!text.contains("ZVEC_GREP"));
+        assert!(
+            !std::fs::read_to_string(&guidance)
+                .expect("read guidance")
+                .contains("ZVEC_GREP")
         );
     }
 
