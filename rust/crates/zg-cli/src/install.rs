@@ -1833,20 +1833,30 @@ fn remove_marked_file(path: &Path, start: &str, end: &str) -> Result<(), Install
 /// Removes a marked TOML block whose span carries a table header, retaining
 /// that header when lines after the end marker still define fields of the
 /// table; dropping it would orphan those user fields at the document root.
+/// Ranges are paired like `replace_marked_block`, so an orphaned start
+/// marker never widens the removal onto surrounding user configuration.
 fn remove_marked_toml_block(path: &Path, start: &str, end: &str) -> Result<(), InstallError> {
     let existing = read_if_exists(path)?;
     if existing.is_empty() {
         return Ok(());
     }
     let lines: Vec<&str> = existing.lines().collect();
-    let Some(begin) = lines.iter().position(|line| line.trim() == start) else {
-        return remove_marked_file(path, start, end);
-    };
-    let Some(finish) = lines[begin + 1..]
-        .iter()
-        .position(|line| line.trim() == end)
-        .map(|offset| begin + 1 + offset)
-    else {
+    let mut marker_lines = HashSet::new();
+    let mut ranges = Vec::new();
+    let mut pending = None;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == start {
+            marker_lines.insert(index);
+            pending = Some(index);
+        } else if trimmed == end {
+            marker_lines.insert(index);
+            if let Some(begin) = pending.take() {
+                ranges.push((begin, index));
+            }
+        }
+    }
+    let Some((begin, finish)) = ranges.last().copied() else {
         return remove_marked_file(path, start, end);
     };
     let Some(header) = lines[begin..=finish]
@@ -1868,26 +1878,37 @@ fn remove_marked_toml_block(path: &Path, start: &str, end: &str) -> Result<(), I
     if !has_dependents {
         return remove_marked_file(path, start, end);
     }
-    let mut parts: Vec<String> = Vec::new();
+    let in_removed_range = |index: usize| {
+        ranges
+            .iter()
+            .any(|(begin, finish)| index >= *begin && index <= *finish)
+    };
     let before = lines[..begin]
         .iter()
-        .filter(|line| {
-            let line = line.trim();
-            line != start && line != end
-        })
-        .copied()
+        .enumerate()
+        .filter(|(index, _)| !marker_lines.contains(index) && !in_removed_range(*index))
+        .map(|(_, line)| *line)
         .collect::<Vec<_>>()
-        .join("\n");
-    let before = before.trim_end();
+        .join("\n")
+        .trim_end()
+        .to_owned();
+    let remainder = tail[dependent_length..]
+        .iter()
+        .enumerate()
+        .filter(|(offset, _)| !marker_lines.contains(&(finish + 1 + dependent_length + offset)))
+        .map(|(_, line)| *line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned();
+    let mut parts: Vec<String> = Vec::new();
     if !before.is_empty() {
-        parts.push(before.to_owned());
+        parts.push(before);
     }
     parts.push(header.to_owned());
     parts.push(tail[..dependent_length].join("\n").trim().to_owned());
-    let remainder = tail[dependent_length..].join("\n");
-    let remainder = remainder.trim();
     if !remainder.is_empty() {
-        parts.push(remainder.to_owned());
+        parts.push(remainder);
     }
     atomic_write(path, &(parts.join("\n\n") + "\n"))
 }
@@ -2785,6 +2806,62 @@ mod tests {
         let root: toml::Value = toml::from_str(&text).expect("valid toml after removal");
         assert!(root.get("permission").is_none());
         assert!(text.contains("# only comments follow"));
+    }
+
+    #[test]
+    fn remove_marked_toml_block_skips_orphaned_start_before_managed_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# ZVEC_GREP_PERMISSION_START\n[other]\nkey = 1\n\n# ZVEC_GREP_PERMISSION_START\n[permission]\nallow = [\"MCPTool(zvec_grep__*)\"]\n# ZVEC_GREP_PERMISSION_END\ndeny = [\"Bash(rm *)\"]\n",
+        )
+        .expect("write config");
+        remove_marked_toml_block(&path, GROK_PERMISSION_START, GROK_PERMISSION_END)
+            .expect("remove");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let root: toml::Value = toml::from_str(&text).expect("valid toml after removal");
+        assert_eq!(
+            root.get("other").and_then(|value| value.get("key")),
+            Some(&toml::Value::Integer(1))
+        );
+        let permission = root.get("permission").expect("permission table retained");
+        assert_eq!(
+            permission.get("deny"),
+            Some(&toml::Value::Array(vec![toml::Value::String(
+                "Bash(rm *)".to_owned()
+            )]))
+        );
+        assert!(permission.get("allow").is_none());
+        assert!(!text.contains("ZVEC_GREP_PERMISSION"));
+    }
+
+    #[test]
+    fn remove_marked_toml_block_ignores_orphaned_end_before_managed_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# ZVEC_GREP_PERMISSION_END\n[other]\nkey = 1\n\n# ZVEC_GREP_PERMISSION_START\n[permission]\nallow = [\"MCPTool(zvec_grep__*)\"]\n# ZVEC_GREP_PERMISSION_END\ndeny = [\"Bash(rm *)\"]\n",
+        )
+        .expect("write config");
+        remove_marked_toml_block(&path, GROK_PERMISSION_START, GROK_PERMISSION_END)
+            .expect("remove");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let root: toml::Value = toml::from_str(&text).expect("valid toml after removal");
+        assert_eq!(
+            root.get("other").and_then(|value| value.get("key")),
+            Some(&toml::Value::Integer(1))
+        );
+        let permission = root.get("permission").expect("permission table retained");
+        assert_eq!(
+            permission.get("deny"),
+            Some(&toml::Value::Array(vec![toml::Value::String(
+                "Bash(rm *)".to_owned()
+            )]))
+        );
+        assert!(permission.get("allow").is_none());
+        assert!(!text.contains("ZVEC_GREP_PERMISSION"));
     }
 
     #[test]
